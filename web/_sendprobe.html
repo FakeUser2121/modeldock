@@ -1,0 +1,294 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>modeldock</title>
+<link rel="stylesheet" href="/css/app.css">
+</head>
+<body>
+<header>
+  <div class="brand">⚓ modeldock</div>
+  <nav id="tabs">
+    <button data-tab="chat" class="tab active">Chat</button>
+    <button data-tab="servers" class="tab">Servers</button>
+    <button data-tab="decisions" class="tab">Decisions</button>
+    <button data-tab="settings" class="tab">Settings</button>
+  </nav>
+  <div class="header-right" id="header-status"></div>
+</header>
+
+<main>
+  <!-- ============ CHAT ============ -->
+  <section id="tab-chat" class="tab-panel active">
+    <div class="chat-layout">
+      <aside class="chat-sidebar">
+        <div class="sidebar-section">
+          <h3>Sessions</h3>
+          <button id="btn-new-session" class="btn small">+ New session</button>
+          <div id="new-session-form" class="hidden">
+            <input id="ns-title" placeholder="Title" class="input">
+            <input id="ns-workspace" placeholder="/path/to/workspace" class="input">
+            <div class="row">
+              <button id="ns-create" class="btn small primary">Create</button>
+              <button id="ns-cancel" class="btn small">Cancel</button>
+            </div>
+          </div>
+          <ul id="session-list" class="session-list"></ul>
+        </div>
+      </aside>
+
+      <div class="chat-main">
+        <div id="chat-toolbar" class="hidden">
+          <div class="chat-head">
+            <div id="chat-title" class="chat-title"></div>
+            <div class="muted small" id="chat-workspace"></div>
+          </div>
+          <div class="toolbar-row">
+            <label>Mode
+              <select id="sel-mode" class="input">
+                <option value="readonly">readonly</option>
+                <option value="write">write</option>
+                <option value="autonomous">autonomous</option>
+                <option value="extend">extend</option>
+              </select>
+            </label>
+            <label>Agent
+              <select id="sel-agent" class="input"></select>
+            </label>
+            <span id="ctx-meter" class="muted small mono"></span>
+            <button id="btn-fork" class="btn small">Fork here</button>
+            <button id="btn-compact" class="btn small">Compact</button>
+          </div>
+          <details id="params-panel">
+            <summary>Parameters &amp; system prompt</summary>
+            <div class="params-grid">
+              <label>temperature <input id="p-temperature" type="number" step="0.1" class="input"></label>
+              <label>top_p <input id="p-top_p" type="number" step="0.05" class="input"></label>
+              <label>max_tokens <input id="p-max_tokens" type="number" step="64" class="input"></label>
+              <label>repeat_penalty <input id="p-repeat_penalty" type="number" step="0.05" class="input"></label>
+            </div>
+            <label class="wide">System prompt (this chat)
+              <textarea id="p-system_prompt" class="input" rows="2"></textarea>
+            </label>
+          </details>
+        </div>
+
+        <div id="messages" class="messages"></div>
+
+        <div id="composer">
+          <div class="composer-models">
+            <label>Server <select id="sel-server" class="input"></select></label>
+            <label>Model <select id="sel-model" class="input"></select></label>
+            <span class="attach">
+              <button id="btn-attach" class="btn small hidden" title="Attach an image (vision models only)">📎 Image</button>
+              <input id="composer-file" type="file" accept="image/*" multiple class="hidden">
+              <span id="composer-img" class="muted small"></span>
+            </span>
+          </div>
+          <textarea id="composer-input" placeholder="Message…" rows="2"></textarea>
+          <div class="row spread">
+            <span id="composer-status" class="muted small"></span>
+            <button id="btn-send" class="btn primary">Send</button>
+          </div>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ============ SERVERS ============ -->
+  <section id="tab-servers" class="tab-panel">
+    <div class="panel-pad">
+      <div class="row spread">
+        <h2>Servers</h2>
+        <button id="btn-add-server" class="btn small">+ Add server</button>
+      </div>
+      <div id="server-form" class="card hidden">
+        <label>Name <input id="sv-name" class="input"></label>
+        <label>URL <input id="sv-url" placeholder="http://127.0.0.1:8080" class="input"></label>
+        <label>API key <input id="sv-key" class="input" placeholder="optional"></label>
+        <label>Context size <input id="sv-ctx" type="number" class="input" placeholder="4096"></label>
+        <label>Description <input id="sv-desc" class="input"></label>
+        <div class="row">
+          <button id="sv-save" class="btn small primary">Save</button>
+          <button id="sv-cancel" class="btn small">Cancel</button>
+        </div>
+      </div>
+      <div id="server-list" class="card-list"></div>
+    </div>
+  </section>
+
+  <!-- ============ DECISIONS ============ -->
+  <section id="tab-decisions" class="tab-panel">
+    <div class="panel-pad">
+      <div class="row spread">
+        <h2>Decision log</h2>
+        <div class="row">
+          <select id="dec-scope" class="input">
+            <option value="">Global (all chats)</option>
+          </select>
+          <select id="dec-kind" class="input">
+            <option value="">All kinds</option>
+          </select>
+          <button id="btn-dec-refresh" class="btn small">Refresh</button>
+        </div>
+      </div>
+      <div id="dec-table-wrap">
+        <table id="dec-table" class="table">
+          <thead><tr><th>When</th><th>Chat</th><th>Kind</th><th>Details</th></tr></thead>
+          <tbody></tbody>
+        </table>
+      </div>
+    </div>
+  </section>
+
+  <!-- ============ SETTINGS ============ -->
+  <section id="tab-settings" class="tab-panel">
+    <div class="panel-pad">
+      <h2>Settings</h2>
+      <div class="card">
+        <h3>Global defaults</h3>
+        <p class="muted small">Applied to every new chat. Per-chat values live in the chat toolbar and override these.</p>
+        <div class="params-grid">
+          <label>default server
+            <select id="cfg-default-server" class="input"></select>
+          </label>
+          <label>default model
+            <select id="cfg-default-model" class="input"></select>
+          </label>
+          <label>temperature <input id="cfg-temperature" type="number" step="0.1" class="input"></label>
+          <label>top_p <input id="cfg-top_p" type="number" step="0.05" class="input"></label>
+          <label>max_tokens <input id="cfg-max_tokens" type="number" step="64" class="input"></label>
+          <label>repeat_penalty <input id="cfg-repeat_penalty" type="number" step="0.05" class="input"></label>
+          <label>default mode
+            <select id="cfg-mode" class="input">
+              <option value="readonly">readonly</option>
+              <option value="write">write</option>
+              <option value="autonomous">autonomous</option>
+              <option value="extend">extend</option>
+            </select>
+          </label>
+          <label>default agent <select id="cfg-agent" class="input"></select></label>
+        </div>
+      </div>
+      <div class="card">
+        <h3>Agent types</h3>
+        <p class="muted small">Prompt templates the model works under. Edit freely; pick one per chat.</p>
+        <div id="agent-types-list" class="card-list"></div>
+        <div class="row">
+          <input id="at-id" class="input" placeholder="id (e.g. architect)">
+          <input id="at-name" class="input" placeholder="Name">
+          <button id="btn-at-add" class="btn small">Add</button>
+        </div>
+      </div>
+      <div class="card">
+        <h3>Allowed outside commands (autonomous mode)</h3>
+        <p class="muted small">Exact command strings the agent may run even though they act outside the chat workspace. One per line.</p>
+        <textarea id="cfg-allowed" class="input" rows="4"></textarea>
+      </div>
+      <div class="card">
+        <h3>MCP servers</h3>
+        <p class="muted small">Model Context Protocol servers. Their tools become available to the agent in write/autonomous/extend modes.</p>
+        <div id="mcp-list" class="card-list"></div>
+        <div class="row">
+          <input id="mcp-name" class="input" placeholder="Name">
+          <select id="mcp-transport" class="input">
+            <option value="stdio">stdio</option>
+            <option value="http">http</option>
+          </select>
+          <input id="mcp-cmd" class="input" placeholder="command (stdio), e.g. npx -y @mcp/x">
+          <input id="mcp-url" class="input" placeholder="url (http)">
+          <button id="btn-mcp-add" class="btn small">Add</button>
+        </div>
+      </div>
+      <div class="card">
+        <h3>Custom tools</h3>
+        <p class="muted small">Declarative tools registered in the harness — by you, or by the model in <b>extend</b> mode. Command templates run inside the sandbox; http tools call a URL. Anything can be disabled, edited, or removed here.</p>
+        <div id="tool-list" class="card-list"></div>
+        <div class="row">
+          <input id="ct-name" class="input" placeholder="name (e.g. fetch_url)">
+          <select id="ct-kind" class="input">
+            <option value="command">command</option>
+            <option value="http">http</option>
+          </select>
+          <input id="ct-template" class="input" placeholder='template, e.g. curl -s {url}  /  http://api.local/{path}'>
+          <input id="ct-params" class="input" placeholder="params, comma-separated: url, path">
+          <input id="ct-desc" class="input" placeholder="description">
+          <button id="btn-ct-add" class="btn small">Add tool</button>
+        </div>
+      </div>
+      <div class="row">
+        <button id="btn-settings-save" class="btn primary">Save settings</button>
+      </div>
+    </div>
+  </section>
+</main>
+
+<script src="/js/app.js"></script>
+<script>
+(function () {
+  const $ = (s) => document.querySelector(s);
+  const SID = "2fa804c5";
+  const out = (txt) => {
+    const p = document.createElement("pre");
+    p.id = "probe-out";
+    p.textContent = "PROBE " + txt;
+    document.body.appendChild(p);
+    fetch("http://127.0.0.1:8891/result", { method: "POST", mode: "no-cors", body: txt });
+  };
+  const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+  (async () => {
+    try {
+      // wait for the app's own boot (it auto-opens the first session)
+      let guard = 0;
+      while (!CURRENT_SESSION && guard++ < 100) await sleep(200);
+      if (!CURRENT_SESSION) return out("NO_SESSION");
+      // open the provisioned session unless boot already opened it
+      if (CURRENT_SESSION.id !== SID) {
+        const li = document.querySelector('#session-list .session-item[data-id="' + SID + '"]');
+        if (!li) return out("NO_LI_FOR_SESSION");
+        openSession(SID, li);
+      }
+      // wait until the session fetch has RESOLVED and the toolbar is filled —
+      // until then openSession/renderHistory can still wipe #messages
+      guard = 0;
+      while (
+        (CURRENT_SESSION.id !== SID || !$("#sel-server").value || !$("#sel-model").value) &&
+        guard++ < 100
+      ) await sleep(200);
+      if (CURRENT_SESSION.id !== SID) return out("OPEN_FAILED");
+      await sleep(1500); // let any pending open/toolbar work settle
+      // the real user path: type, then press Enter
+      const input = $("#composer-input");
+      input.value = "hello";
+      input.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", bubbles: true, cancelable: true }));
+      // wait until the turn ends (status done/error) and read the final DOM
+      let reply = "";
+      let status = "";
+      let userText = "";
+      guard = 0;
+      while (guard++ < 1500) { // up to 10 min: reasoning models take minutes per turn
+        await sleep(400);
+        status = $("#composer-status").textContent;
+        const users = document.querySelectorAll("#messages .msg.user .msg-body");
+        userText = users.length ? users[users.length - 1].textContent : "";
+        const as = document.querySelectorAll("#messages .msg.assistant .msg-body");
+        reply = as.length ? as[as.length - 1].textContent : "";
+        if (/done|error/.test(status)) break;
+      }
+      out(JSON.stringify({
+        sent: userText === "hello" && reply !== "" && /done/.test(status) && !/error/.test(status),
+        user_rendered: userText,
+        reply: reply.slice(0, 300),
+        status: status,
+        composer_cleared: input.value === ""
+      }));
+    } catch (e) {
+      out("ERROR " + e.message);
+    }
+  })();
+})();
+</script>
+
+</body>
+</html>
