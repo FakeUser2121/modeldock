@@ -99,15 +99,6 @@ DEFAULT_CONFIG = {
     ],
     "mcp_servers": [],
     # {id, name, transport: stdio|http, command, args, env, url, enabled}
-    # browser subsystem (Ego-Lite-style CDP tools; docs/ego-lite-integration-plan.md)
-    "browser": {
-        "enabled": True,
-        "idle_timeout_s": 300,  # tear down an idle per-chat browser after this long
-        "frame_fps": 1,          # live pane cadence (sidecar already throttles frames to 1/s)
-        "viewport": "1280x720",  # headful window size (software-GL rendered, CPU-only)
-        "cpu_only": True,        # enforce software GL (SwiftShader); never touch the GPU
-        "default_origins": [],   # origins needing no approval for navigation
-    },
 }
 
 

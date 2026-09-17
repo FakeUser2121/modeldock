@@ -1,6 +1,6 @@
 # Integration Plan: Ego-Lite as a first-class ModelDock agent tool
 
-Status: STAGE 2 DONE (Go CDP sidecar + per-chat Python supervisor, e2e-verified; stages 3-8 pending).
+Status: PLAN (repo under jj; no code changes yet beyond .gitignore + this doc).
 Constraint set honored: live browser view INSIDE the ModelDock window beside the chat (no separate OS
 window); browser forced to CPU/RAM only, never GPU; extremely low resource use when the browser is
 unused; integrate with ModelDock's existing sandbox + approval system; keep as much Ego-Lite
@@ -316,35 +316,6 @@ Screencast findings (production-critical):
   chromium stderr to `<profile>/chromium.log`.
 - Clean teardown verified: close = ctx cancel + allocator cancel + SIGTERM, 10s wait, Kill;
   no chromium process left (checked with anchored ps).
-
-## 8.6 Stage 2 verification log (per-chat supervisor, e2e)
-
-Supervisor (harness/browser/supervisor.py): one `mdock-cdp --serve <profile>` per chat,
-spawned lazily on first `ensure_started`; JSONL-over-stdin protocol with a per-chat reply
-queue; state.json persistence; idle teardown thread (default 300 s, config
-`browser.idle_timeout_s`); frame_bytes() reads the latest frame.jpg; close() = SIGTERM +
-wait + Kill.
-
-Defect found and fixed this stage (root cause of the reply-delivery hang):
-- `threading.Lock` is not reentrant: `ensure_started` held `self.lock` while calling
-  `self.status()` (which re-acquires the same lock) -> permanent block after
-  `_send("open")` had completed (evidence: state.json written with running=true, then
-  hang before the START print). Fix: release the lock before returning `status()`;
-  `_send` takes no lock, and `send`/`close` hold the lock and call only lock-free helpers.
-
-E2E smoke (tests/browser_smoke.py, chat 20db2937, warm profile):
-- STATUS0 running=false -> START t=0.9 s (chromium spawn + chromedp attach)
-- screencast_start ok; MID status screencast=true; frame mtime advances at 1/s
-- FRAME: 1731 B, header ffd8ffe0 (valid JPEG)
-- EVAL: "410px" (JS round trip through the sidecar)
-- CLOSE {closed:true, was_running:true}; END running=false; no chromium process left
-- Static-page caveat unchanged (compositor BeginFrames): a truly static page yields at most
-  the initial composite frame -> the Stage 3 pane must fall back to Page.captureScreenshot
-  until a screencast frame arrives or on stall.
-
-Diagnosis notes: two standalone supervisor-equivalent repros passed in 0.4-0.5 s with
-stderr debug markers on the Go sidecar, exonerating the Go sidecar. The markers were
-removed in the final stage-1 sources.
 
 ## 9. Open questions (resolved during implementation)
 
