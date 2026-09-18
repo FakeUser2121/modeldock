@@ -34,10 +34,12 @@ type session struct {
 	target      *chromedp.Target
 	profileDir  string
 	eventsLog   *os.File
+	chromeLog   *os.File
 	logMu       sync.Mutex
 	frameMu     sync.Mutex
 	framePath   string
 	lastFrame   time.Time
+	listening   bool
 }
 
 // logEvent appends every CDP event reaching the attached target to
@@ -153,7 +155,7 @@ func (s *session) screenshot(path string) error {
 	data, _ := res["data"].(string)
 	b, err := base64.StdEncoding.DecodeString(data)
 	if err != nil { return err }
-	return os.WriteFile(path, b, 0o644)
+	return writeFileAtomic(path, b)
 }
 
 // startScreencast begins streaming page frames (JPEG) to path. Frames are
@@ -166,29 +168,38 @@ func (s *session) screenshot(path string) error {
 // kActive). We retry with backoff so a navigate→screencast sequence works.
 func (s *session) startScreencast(path string) error {
 	s.frameMu.Lock()
-	defer s.frameMu.Unlock()
 	if s.framePath != "" {
+		s.frameMu.Unlock()
 		return nil
 	}
 	s.framePath = path
-	frames := make(chan *page.EventScreencastFrame, 8)
-	go func() {
-		for e := range frames {
-			if b, err := base64.StdEncoding.DecodeString(e.Data); err == nil {
-				s.writeFrameThrottled(b)
+	first := !s.listening
+	s.listening = true
+	s.frameMu.Unlock()
+
+	if first {
+		// Register the listener exactly once per session. Registering it on
+		// every start leaked a goroutine and an extra handler per stop/start
+		// cycle, so each frame was decoded, written and acked N times over.
+		frames := make(chan *page.EventScreencastFrame, 8)
+		go s.frameWriter(frames)
+		chromedp.ListenTarget(s.ctx, func(ev any) {
+			s.logEvent(ev)
+			if e, ok := ev.(*page.EventScreencastFrame); ok {
+				// Ack first, always, and never from inside the throttle:
+				// Chromium stops sending frames until the previous one is
+				// acked, so acking after a up-to-1s write delay throttled the
+				// stream itself down instead of just the file writes.
+				_ = s.target.Execute(s.ctx, "Page.screencastFrameAck",
+					map[string]any{"sessionId": e.SessionID}, nil)
+				select {
+				case frames <- e:
+				default: // writer busy: drop this frame, a newer one is coming
+				}
 			}
-			_ = s.target.Execute(s.ctx, "Page.screencastFrameAck", map[string]any{"sessionId": e.SessionID}, nil)
-		}
-	}()
-	chromedp.ListenTarget(s.ctx, func(ev any) {
-		s.logEvent(ev)
-		if e, ok := ev.(*page.EventScreencastFrame); ok {
-			select {
-			case frames <- e:
-			default:
-			}
-		}
-	})
+		})
+	}
+
 	params := map[string]any{"format": "jpeg", "quality": 50, "maxWidth": 640, "maxHeight": 360, "everyNthFrame": 2}
 	var lastErr error
 	for attempt := 0; attempt < 5; attempt++ {
@@ -200,7 +211,47 @@ func (s *session) startScreencast(path string) error {
 			return nil
 		}
 	}
+	s.frameMu.Lock()
+	s.framePath = ""
+	s.frameMu.Unlock()
 	return lastErr
+}
+
+// frameWriter decodes and writes frames, at most one per second.
+func (s *session) frameWriter(frames <-chan *page.EventScreencastFrame) {
+	for e := range frames {
+		s.frameMu.Lock()
+		path := s.framePath
+		last := s.lastFrame
+		s.frameMu.Unlock()
+		if path == "" {
+			continue // screencast stopped; nothing to write to
+		}
+		if time.Since(last) < time.Second {
+			continue // throttle by dropping, not by sleeping
+		}
+		b, err := base64.StdEncoding.DecodeString(e.Data)
+		if err != nil {
+			continue
+		}
+		if err := writeFileAtomic(path, b); err != nil {
+			continue
+		}
+		s.frameMu.Lock()
+		s.lastFrame = time.Now()
+		s.frameMu.Unlock()
+	}
+}
+
+// writeFileAtomic writes via a temp file in the same directory and renames,
+// so a reader polling the frame never sees a half-written JPEG.
+func writeFileAtomic(path string, b []byte) error {
+	tmp := path + ".tmp"
+	if err := os.WriteFile(tmp, b, 0o644); err != nil {
+		_ = os.Remove(tmp)
+		return err
+	}
+	return os.Rename(tmp, path)
 }
 
 func (s *session) logEvent(ev any) {
@@ -217,24 +268,15 @@ func (s *session) logEvent(ev any) {
 	s.logMu.Unlock()
 }
 
-// writeFrameThrottled writes a frame at most once per second.
-func (s *session) writeFrameThrottled(b []byte) {
-	for time.Since(s.lastFrame) < time.Second {
-		time.Sleep(100 * time.Millisecond)
-	}
-	if err := os.WriteFile(s.framePath, b, 0o644); err == nil {
-		s.lastFrame = time.Now()
-	}
-}
-
 // stopScreencast stops frame streaming; the listener keeps running but idle.
 func (s *session) stopScreencast() error {
 	s.frameMu.Lock()
-	defer s.frameMu.Unlock()
 	if s.framePath == "" {
+		s.frameMu.Unlock()
 		return nil
 	}
 	s.framePath = ""
+	s.frameMu.Unlock()
 	return s.target.Execute(s.ctx, "Page.stopScreencast", nil, nil)
 }
 
@@ -256,4 +298,14 @@ func (s *session) close() {
 	if s.cmd != nil && s.cmd.Process != nil {
 		_ = s.cmd.Process.Signal(syscall.SIGTERM)
 	}
+	s.logMu.Lock()
+	if s.eventsLog != nil {
+		_ = s.eventsLog.Close()
+		s.eventsLog = nil
+	}
+	if s.chromeLog != nil {
+		_ = s.chromeLog.Close()
+		s.chromeLog = nil
+	}
+	s.logMu.Unlock()
 }

@@ -62,7 +62,13 @@ func reply(id string, ok bool, value any, errMsg string) {
 
 // shutdown detaches chromedp, SIGTERMs chromium, waits up to 10s, then kills.
 func shutdown(s *session) {
+	if s == nil {
+		return
+	}
 	s.close()
+	if s.cmd == nil || s.cmd.Process == nil {
+		return
+	}
 	done := make(chan struct{})
 	go func() { _ = s.cmd.Wait(); close(done) }()
 	select {
@@ -91,17 +97,24 @@ func main() {
 
 	s, err := spawnChromium(profile, url)
 	if err != nil { fmt.Fprintln(os.Stderr, "spawn:", err); os.Exit(1) }
-	defer shutdown(s)
+	// os.Exit skips deferred calls, so every error path below has to tear the
+	// browser down itself or it leaves a Chromium behind.
+	fail := func(what string, err error) {
+		fmt.Fprintln(os.Stderr, what+":", err)
+		shutdown(s)
+		os.Exit(1)
+	}
 
 	res, err := s.evalJS(js)
-	if err != nil { fmt.Fprintln(os.Stderr, "eval:", err); os.Exit(1) }
+	if err != nil { fail("eval", err) }
 	b, _ := json.Marshal(res)
 	fmt.Println(string(b))
 
 	if shot != "" {
-		if err := s.screenshot(shot); err != nil { fmt.Fprintln(os.Stderr, "screenshot:", err); os.Exit(1) }
+		if err := s.screenshot(shot); err != nil { fail("screenshot", err) }
 		fmt.Fprintln(os.Stderr, "screenshot ->", shot)
 	}
+	shutdown(s)
 }
 
 // serve runs the JSONL command loop until "close" or stdin EOF.
@@ -208,6 +221,11 @@ func serve(profile string) {
 		default:
 			reply(c.ID, false, nil, "unknown cmd: "+c.Cmd)
 		}
+	}
+	// A scanner error (e.g. a command line over the 1MB buffer) ends the
+	// loop just like EOF does; say so on stderr instead of vanishing.
+	if err := sc.Err(); err != nil {
+		fmt.Fprintln(os.Stderr, "stdin scan:", err)
 	}
 	// stdin EOF: clean teardown of the sidecar.
 	if s != nil {
