@@ -11,6 +11,7 @@ nothing ever has to be entered twice:
 Per-chat settings live in each session's meta.json (see chat.py) — those are
 the "local" settings; this file is the "global" one.
 """
+import copy
 import json
 import os
 import threading
@@ -33,6 +34,30 @@ def _set_cache(cfg: dict, key: tuple | None) -> None:
     global _cache, _cache_key
     _cache = cfg
     _cache_key = key
+
+
+def _merge_defaults(cur: dict, defaults: dict) -> tuple[dict, bool]:
+    """Fill in keys the stored config is missing, without touching set ones.
+
+    An install created before a key existed (e.g. `browser`, or `agent_types`
+    on a config written by an older build) otherwise reads back as an empty
+    section forever: `load().get("agent_types", [])` returns [] and every
+    chat silently loses its persona prompt. Only absent keys are added --
+    a user's own value, including an empty list they chose, is preserved
+    verbatim. Returns (merged, changed).
+    """
+    changed = False
+    out = dict(cur)
+    for k, dv in defaults.items():
+        if k not in out:
+            out[k] = copy.deepcopy(dv)
+            changed = True
+        elif isinstance(dv, dict) and isinstance(out.get(k), dict):
+            sub, sub_changed = _merge_defaults(out[k], dv)
+            if sub_changed:
+                out[k] = sub
+                changed = True
+    return out, changed
 
 DEFAULT_CONFIG = {
     "servers": [],
@@ -120,34 +145,68 @@ def load() -> dict:
     """Load config, creating defaults on first run.
 
     Cached by (mtime, size): a hit avoids the file read + JSON parse on
-    every turn/tool call. Callers must not mutate the returned dict in
-    place without calling `save()` (all current callers read-only or
-    save a fresh dict).
+    every turn/tool call. Missing sections are back-filled from
+    DEFAULT_CONFIG (see `_merge_defaults`) and written back once, so an
+    older config.json gains new keys instead of reading as empty.
+
+    The caller gets its own copy: the cache is shared across threads and
+    a caller that appends to e.g. `cfg["mcp_servers"]` would otherwise
+    mutate every other reader's view (and the cache) in place.
     """
     with _lock:
         _ensure_dirs()
         p = DATA_DIR / "config.json"
         if not p.exists():
-            cfg = json.loads(json.dumps(DEFAULT_CONFIG))
-            p.write_text(json.dumps(cfg, indent=2), encoding="utf-8")
-            _set_cache(cfg, None)
-            return cfg
+            cfg = copy.deepcopy(DEFAULT_CONFIG)
+            _write(p, cfg)
+            try:
+                st = p.stat()
+                _set_cache(cfg, (st.st_mtime_ns, st.st_size))
+            except OSError:
+                _set_cache(cfg, None)
+            return copy.deepcopy(cfg)
         try:
             st = p.stat()
         except OSError:
             st = None
         key = (st.st_mtime_ns, st.st_size) if st else None
         if _cache is not None and key is not None and key == _cache_key:
-            return _cache
+            return copy.deepcopy(_cache)
         try:
             cfg = json.loads(p.read_text(encoding="utf-8"))
-        except json.JSONDecodeError:
-            cfg = json.loads(json.dumps(DEFAULT_CONFIG))
-            p.write_text(json.dumps(cfg, indent=2), encoding="utf-8")
+            if not isinstance(cfg, dict):
+                raise json.JSONDecodeError("config root is not an object", "", 0)
+        except (json.JSONDecodeError, OSError):
+            # Keep the unreadable file instead of silently destroying it;
+            # the user may want to repair it by hand.
+            _backup(p)
+            cfg = copy.deepcopy(DEFAULT_CONFIG)
+            _write(p, cfg)
+        else:
+            cfg, changed = _merge_defaults(cfg, DEFAULT_CONFIG)
+            if changed:
+                _write(p, cfg)
+        try:
             st = p.stat()
             key = (st.st_mtime_ns, st.st_size)
+        except OSError:
+            key = None
         _set_cache(cfg, key)
-        return cfg
+        return copy.deepcopy(cfg)
+
+
+def _write(target: Path, cfg: dict) -> None:
+    """Atomic write (same-directory temp + rename)."""
+    tmp = target.with_suffix(".tmp")
+    tmp.write_text(json.dumps(cfg, indent=2, ensure_ascii=False), encoding="utf-8")
+    tmp.replace(target)
+
+
+def _backup(p: Path) -> None:
+    try:
+        p.replace(p.with_suffix(".corrupt"))
+    except OSError:
+        pass
 
 
 def save(cfg: dict) -> None:
@@ -155,8 +214,15 @@ def save(cfg: dict) -> None:
     with _lock:
         _ensure_dirs()
         target = DATA_DIR / "config.json"
-        tmp = target.with_suffix(".tmp")
-        tmp.write_text(json.dumps(cfg, indent=2, ensure_ascii=False), encoding="utf-8")
-        tmp.replace(target)
-        st = target.stat()
-        _set_cache(cfg, (st.st_mtime_ns, st.st_size))
+        if not isinstance(cfg, dict):
+            raise ValueError("config must be a JSON object")
+        cfg, _ = _merge_defaults(cfg, DEFAULT_CONFIG)
+        _write(target, cfg)
+        # Cache a private copy: the caller keeps its own dict and may go on
+        # mutating it after saving.
+        snapshot = copy.deepcopy(cfg)
+        try:
+            st = target.stat()
+            _set_cache(snapshot, (st.st_mtime_ns, st.st_size))
+        except OSError:
+            _set_cache(snapshot, None)

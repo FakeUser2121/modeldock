@@ -19,7 +19,7 @@ print("STATUS0", json.dumps(br.status(cid)), flush=True)
 
 url = "data:text/html," + (
     "<html><body style='margin:0;background:white'>"
-    "<div id='b' style='position:absolute;left:5px;top:40px;width:120px;height:40px;background:teal'></div>'
+    "<div id='b' style='position:absolute;left:5px;top:40px;width:120px;height:40px;background:teal'></div>"
     "<script>var x=5;var b=document.getElementById('b');"
     "setInterval(function(){x=x+5>1000?0:x+5;b.style.left=x+'px';},50);"
     "</script></body></html>"

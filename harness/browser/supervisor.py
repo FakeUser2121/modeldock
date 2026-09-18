@@ -22,7 +22,6 @@ CPU usage stays flat when the browser is not being used.
 """
 import json
 import os
-import queue
 import subprocess
 import threading
 import time
@@ -55,6 +54,15 @@ _registry_lock = threading.Lock()
 _idle_thread: threading.Thread | None = None
 
 
+def _close_streams(proc: subprocess.Popen) -> None:
+    for stream in (proc.stdin, proc.stdout, proc.stderr):
+        try:
+            if stream is not None:
+                stream.close()
+        except OSError:
+            pass
+
+
 class _Browser:
     """One sidecar process + its per-chat files."""
 
@@ -65,8 +73,15 @@ class _Browser:
         self.frame_file = self.dir / "frame.jpg"
         self.state_file = self.dir / "state.json"
         self.proc: subprocess.Popen | None = None
-        self.reader: queue.Queue | None = None
-        self.lock = threading.Lock()
+        self.log_file = None
+        # Reentrant: ensure_started() -> status() re-enters, and so does
+        # close() -> _await_exit(). A plain Lock deadlocks on those paths.
+        self.lock = threading.RLock()
+        self._write_lock = threading.Lock()
+        self._pending: dict[str, dict] = {}
+        self._pending_lock = threading.Lock()
+        self._seq = 0
+        self._reader_thread: threading.Thread | None = None
         self.started_at = 0.0
         self.last_activity = 0.0
         self.url = ""
@@ -78,17 +93,19 @@ class _Browser:
         return self.proc is not None and self.proc.poll() is None
 
     def ensure_started(self, url: str = "") -> dict:
-        """Spawn the sidecar (and Chromium) on first use; idempotent.
-
-        Note: status() re-acquires self.lock, so it must be called AFTER
-        releasing it (threading.Lock is not reentrant).
-        """
+        """Spawn the sidecar (and Chromium) on first use; idempotent."""
         with self.lock:
             if not self.is_running():
                 self._spawn(url or "about:blank")
-        return self.status()
+            return self.status()
 
     def _spawn(self, url: str) -> None:
+        if not Path(BIN).exists():
+            raise BrowserError(
+                f"CDP sidecar binary not found at {BIN}. Build it with "
+                "`cd go/cdpgate && go build -o mdock-cdp .`, or point "
+                "MODELDOCK_CDP_BIN at it."
+            )
         self.profile.mkdir(parents=True, exist_ok=True)
         env = dict(os.environ)
         home = os.environ.get("HOME") or os.path.expanduser("~")
@@ -98,33 +115,74 @@ class _Browser:
             home = str(self.profile / "home")
             Path(home).mkdir(parents=True, exist_ok=True)
         env["HOME"] = home
-        log = open(self.profile / "sidecar.log", "ab")
-        self.proc = subprocess.Popen(
-            [str(BIN), "--serve", str(self.profile)],
-            stdin=subprocess.PIPE,
-            stdout=subprocess.PIPE,
-            stderr=log,
-            env=env,
-            cwd=str(self.profile),
+        self.log_file = open(self.profile / "sidecar.log", "ab")
+        try:
+            self.proc = subprocess.Popen(
+                [str(BIN), "--serve", str(self.profile)],
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=self.log_file,
+                env=env,
+                cwd=str(self.profile),
+            )
+        except OSError as e:
+            self._close_log()
+            raise BrowserError(f"cannot start sidecar {BIN}: {e}") from e
+        with self._pending_lock:
+            self._pending.clear()
+        self._reader_thread = threading.Thread(
+            target=self._reader_loop, args=(self.proc,), daemon=True
         )
-        self.reader = queue.Queue()
-        threading.Thread(target=self._reader_loop, daemon=True).start()
+        self._reader_thread.start()
         self.started_at = time.time()
         self.last_activity = time.time()
-        res = self._send({"cmd": "open", "url": url}, timeout=CMD_TIMEOUT_S)
+        try:
+            res = self._send({"cmd": "open", "url": url}, timeout=CMD_TIMEOUT_S)
+        except BrowserError:
+            self._force_stop()
+            raise
         if not res.get("ok"):
+            self._force_stop()
             raise BrowserError(f"sidecar open failed: {res.get('error')}")
         v = res.get("value") or {}
         self.url = v.get("url") or url
         self._save_state()
 
-    def _reader_loop(self) -> None:
-        assert self.proc is not None
+    def _reader_loop(self, proc: subprocess.Popen) -> None:
+        """Route each response line to the waiter that asked for it.
+
+        Responses are matched on the `id` echoed by the sidecar. Without
+        that matching, one timed-out command left its late reply in a plain
+        FIFO and every later command got the *previous* command's answer --
+        a permanent off-by-one: `status` returning a stale URL, `eval`
+        returning the screenshot's result, and so on.
+        """
         try:
-            for line in self.proc.stdout:
-                self.reader.put(line.decode("utf-8", "replace"))
+            for raw in proc.stdout:
+                line = raw.decode("utf-8", "replace").strip()
+                if not line:
+                    continue
+                try:
+                    res = json.loads(line)
+                except json.JSONDecodeError:
+                    continue  # sidecar noise on stdout; ignore
+                rid = str(res.get("id") or "")
+                with self._pending_lock:
+                    slot = self._pending.pop(rid, None)
+                if slot is None:
+                    continue  # late reply to an abandoned command: drop it
+                slot["response"] = res
+                slot["event"].set()
         except (OSError, ValueError):
             pass
+        finally:
+            # stdout closed: the sidecar is gone. Wake everyone waiting.
+            with self._pending_lock:
+                slots = list(self._pending.values())
+                self._pending.clear()
+            for slot in slots:
+                slot["response"] = None
+                slot["event"].set()
 
     # ------------------------------------------------------------ commands
 
@@ -135,6 +193,7 @@ class _Browser:
                 raise BrowserNotRunning(f"browser not running for chat {self.chat_id}")
             if cmd == "screencast_start":
                 fields.setdefault("path", str(self.frame_file))
+                self.frame_file.parent.mkdir(parents=True, exist_ok=True)
             res = self._send({"cmd": cmd, **fields})
             if res.get("ok"):
                 if cmd == "screencast_start":
@@ -145,66 +204,175 @@ class _Browser:
                     self._await_exit()
             return res
 
-    def _send(self, cmd: dict, timeout: float = CMD_TIMEOUT_S) -> dict:
+    def _next_id(self) -> str:
+        with self._pending_lock:
+            self._seq += 1
+            return f"{self._seq}"
+
+    def _send(self, cmd: dict, timeout: float | None = None) -> dict:
+        timeout = CMD_TIMEOUT_S if timeout is None else timeout
+        proc = self.proc
+        if proc is None or proc.poll() is not None:
+            raise BrowserNotRunning(f"browser not running for chat {self.chat_id}")
         line = dict(cmd)
-        line["id"] = str(int(time.monotonic() * 1000))
+        rid = self._next_id()
+        line["id"] = rid
+        slot = {"event": threading.Event(), "response": None}
+        with self._pending_lock:
+            self._pending[rid] = slot
         payload = (json.dumps(line) + "\n").encode("utf-8")
-        self.proc.stdin.write(payload)
-        self.proc.stdin.flush()
+        try:
+            with self._write_lock:
+                proc.stdin.write(payload)
+                proc.stdin.flush()
+        except (BrokenPipeError, OSError, ValueError) as e:
+            with self._pending_lock:
+                self._pending.pop(rid, None)
+            raise BrowserError(f"sidecar stdin closed (cmd={cmd.get('cmd')!r}): {e}") from e
         self.last_activity = time.time()
-        try:
-            raw = self.reader.get(timeout=timeout)
-        except queue.Empty:
-            raise BrowserError(f"sidecar timed out after {timeout:.0f}s (cmd={cmd.get('cmd')!r})")
-        try:
-            res = json.loads(raw)
-        except json.JSONDecodeError:
-            raise BrowserError(f"bad sidecar response: {raw[:200]!r}")
+
+        deadline = time.monotonic() + timeout
+        while True:
+            if slot["event"].wait(timeout=0.25):
+                break
+            if proc.poll() is not None:
+                # process died; the reader's finally clause wakes us, but do
+                # not rely on it if stdout was already closed.
+                slot["event"].wait(timeout=0.5)
+                break
+            if time.monotonic() >= deadline:
+                with self._pending_lock:
+                    self._pending.pop(rid, None)
+                raise BrowserError(
+                    f"sidecar timed out after {timeout:.0f}s (cmd={cmd.get('cmd')!r})"
+                )
+        res = slot["response"]
+        if res is None:
+            code = proc.poll()
+            raise BrowserError(
+                f"sidecar exited (code={code}) while running {cmd.get('cmd')!r}; "
+                f"see {self.profile / 'sidecar.log'}"
+            )
+        self.last_activity = time.time()
         self._save_state()
         return res
 
-    def _await_exit(self) -> None:
+    def _close_log(self) -> None:
         try:
-            self.proc.wait(timeout=STOP_TIMEOUT_S)
-        except subprocess.TimeoutExpired:
-            self.proc.kill()
-        self.proc = None
-        self.reader = None
+            if self.log_file is not None:
+                self.log_file.close()
+        except OSError:
+            pass
+        self.log_file = None
+
+    def _force_stop(self) -> None:
+        """Kill the sidecar without asking it nicely (startup failure path)."""
+        proc, self.proc = self.proc, None
+        if proc is not None:
+            try:
+                proc.kill()
+                proc.wait(timeout=STOP_TIMEOUT_S)
+            except (OSError, subprocess.TimeoutExpired):
+                pass
+            _close_streams(proc)
+        self._close_log()
+        self.url = ""
+        self.screencast = False
+
+    def _await_exit(self) -> None:
+        proc, self.proc = self.proc, None
+        if proc is not None:
+            try:
+                proc.wait(timeout=STOP_TIMEOUT_S)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                try:
+                    proc.wait(timeout=STOP_TIMEOUT_S)
+                except subprocess.TimeoutExpired:
+                    pass
+            # Close the pipes: without this every browser cycle leaks three
+            # file descriptors, and a long-lived server eventually runs out.
+            _close_streams(proc)
+        if self._reader_thread is not None:
+            self._reader_thread.join(timeout=2.0)
+            self._reader_thread = None
+        self._close_log()
+        with self._pending_lock:
+            self._pending.clear()
         self.url = ""
 
     # -------------------------------------------------------------- state
 
+    def _base_status(self) -> dict:
+        return {
+            "running": self.is_running(),
+            "chat_id": self.chat_id,
+            "url": self.url or None,
+            "screencast": self.screencast,
+            "started_at": self.started_at or None,
+            "last_activity": self.last_activity or None,
+            "frame_file": str(self.frame_file),
+            "profile": str(self.profile),
+        }
+
     def status(self) -> dict:
-        """Live status dict for the UI routes and the browser_* tools."""
-        with self.lock:
-            base = {
-                "running": self.is_running(),
-                "chat_id": self.chat_id,
-                "url": self.url or None,
-                "screencast": self.screencast,
-                "started_at": self.started_at or None,
-                "last_activity": self.last_activity or None,
-                "frame_file": str(self.frame_file),
-                "profile": str(self.profile),
-            }
-            if not base["running"]:
-                return base
-            res = self._send({"cmd": "status"}, timeout=15.0)
-            v = res.get("value") or {}
-            base["pid"] = self.proc.pid
-            base["url"] = v.get("url") or self.url
+        """Live status dict for the UI routes and the browser_* tools.
+
+        The live pane polls this once a second, so it must never sit behind
+        a slow navigate holding the lifecycle lock: if the browser is busy,
+        report the cached state and say so.
+        """
+        if not self.lock.acquire(timeout=0.75):
+            base = self._base_status()
+            base["busy"] = True
+            if self.proc is not None:
+                base["pid"] = self.proc.pid
             try:
                 st = self.frame_file.stat()
                 base["frame"] = {"mtime": st.st_mtime, "size": st.st_size}
-            except FileNotFoundError:
+            except OSError:
                 base["frame"] = None
             return base
+        try:
+            base = self._base_status()
+            if not base["running"]:
+                return base
+            base["pid"] = self.proc.pid
+            try:
+                res = self._send({"cmd": "status"}, timeout=15.0)
+            except BrowserError as e:
+                # A wedged sidecar must not make the whole status route hang
+                # or 500: report what is known and say why it is partial.
+                base["error"] = str(e)
+            else:
+                v = res.get("value") or {}
+                base["url"] = v.get("url") or self.url
+            try:
+                st = self.frame_file.stat()
+                base["frame"] = {"mtime": st.st_mtime, "size": st.st_size}
+            except OSError:
+                base["frame"] = None
+            return base
+        finally:
+            self.lock.release()
 
     def frame_bytes(self) -> bytes | None:
-        try:
-            return self.frame_file.read_bytes()
-        except FileNotFoundError:
-            return None
+        """Latest frame, or None if there is not a complete one yet.
+
+        The sidecar rewrites frame.jpg in place, so a read can land midway
+        through a write and return a truncated image. Retry briefly and only
+        hand back data that starts and ends with the JPEG markers.
+        """
+        for attempt in range(3):
+            try:
+                data = self.frame_file.read_bytes()
+            except OSError:
+                return None
+            if len(data) > 4 and data[:2] == b"\xff\xd8" and data[-2:] == b"\xff\xd9":
+                return data
+            if attempt < 2:
+                time.sleep(0.05)
+        return data or None
 
     def close(self) -> dict:
         with self.lock:
@@ -214,6 +382,9 @@ class _Browser:
                     self._send({"cmd": "close"}, timeout=STOP_TIMEOUT_S)
                 except (BrowserError, OSError):
                     pass
+                self._await_exit()
+            else:
+                # Never started, or already exited: still release any fds.
                 self._await_exit()
             self.screencast = False
             self._save_state()
@@ -246,15 +417,32 @@ class _Browser:
 # ------------------------------------------------------------ module API
 
 def _get(chat_id: str, create: bool = False) -> _Browser | None:
-    meta = ch.get_session(chat_id)
-    if meta is None:
+    """The browser for this chat.
+
+    An already-registered browser is returned even when the session's meta
+    has gone (deleted chat, moved workspace): otherwise its Chromium would
+    be unreachable and keep running forever. Only *creating* one needs a
+    live session, since that is what supplies the session folder.
+    """
+    with _registry_lock:
+        b = _registry.get(chat_id)
+    if b is not None:
+        return b
+    if not create:
+        return None
+    if ch.get_session(chat_id) is None:
         return None
     with _registry_lock:
         b = _registry.get(chat_id)
-        if b is None and create:
+        if b is None:
             b = _Browser(chat_id, ch.session_dir(chat_id))
             _registry[chat_id] = b
         return b
+
+
+def _forget(chat_id: str) -> None:
+    with _registry_lock:
+        _registry.pop(chat_id, None)
 
 
 def _idle_watch() -> None:
@@ -264,24 +452,34 @@ def _idle_watch() -> None:
         _idle_thread.start()
 
 
+def _idle_timeout() -> float:
+    try:
+        bcfg = cfg.load().get("browser") or {}
+        return max(10.0, float(bcfg.get("idle_timeout_s", 300)))
+    except (OSError, ValueError, TypeError):
+        return 300.0
+
+
 def _idle_loop() -> None:
     """Tear down browsers idle longer than browser.idle_timeout_s."""
     while True:
         time.sleep(IDLE_POLL_S)
-        try:
-            bcfg = cfg.load().get("browser") or {}
-            timeout = float(bcfg.get("idle_timeout_s", 300))
-        except Exception:
-            timeout = 300.0
+        timeout = _idle_timeout()
         now = time.time()
         with _registry_lock:
-            items = list(_registry.values())
-        for b in items:
-            if b.is_running() and b.last_activity and now - b.last_activity > timeout:
-                try:
-                    b.close()
-                except Exception:
-                    pass
+            items = list(_registry.items())
+        for chat_id, b in items:
+            try:
+                if b.is_running():
+                    if b.last_activity and now - b.last_activity > timeout:
+                        b.close()
+                        _forget(chat_id)
+                elif b.proc is None and b.started_at:
+                    # already stopped: drop it so the registry does not grow
+                    # without bound over the life of the server
+                    _forget(chat_id)
+            except Exception:
+                continue
 
 
 def ensure_started(chat_id: str, url: str = "") -> dict:
@@ -319,15 +517,19 @@ def close(chat_id: str) -> dict:
     b = _get(chat_id)
     if b is None:
         return {"closed": True, "was_running": False}
-    return b.close()
+    try:
+        return b.close()
+    finally:
+        _forget(chat_id)
 
 
 def shutdown_all() -> None:
     """Tear down every sidecar (server shutdown hook)."""
     with _registry_lock:
-        items = list(_registry.values())
-    for b in items:
+        items = list(_registry.items())
+    for chat_id, b in items:
         try:
             b.close()
         except Exception:
             pass
+        _forget(chat_id)

@@ -263,6 +263,8 @@ async def run_turn(chat_id: str, user_text: str, images: list | None = None, rep
     turn_stats: list[dict] = []  # per-LLM-call tps/pps/prompt/completion
     turn_files: list[str] = []  # files this turn wrote or edited
     cached_tokens = 0
+    final_round = False
+    error_message: str | None = None
     try:
         retried_no_tools = False
         while True:
@@ -329,8 +331,8 @@ async def run_turn(chat_id: str, user_text: str, images: list | None = None, rep
                     retried_no_tools = True
                     tools = None
                     continue
-                yield {"type": "error", "message": got_error.get("message", "model error")}
-                return
+                error_message = got_error.get("message", "model error")
+                break
 
             t_call_end = time.monotonic()
             u = usage_call or {}
@@ -458,11 +460,29 @@ async def run_turn(chat_id: str, user_text: str, images: list | None = None, rep
                 )
             tool_rounds += 1
             if tool_rounds >= MAX_TOOL_ROUNDS:
-                yield {"type": "error", "message": "stopped: too many tool rounds"}
-                return
+                if final_round:
+                    break
+                # Don't throw the turn away: tell the model it is out of tool
+                # budget and let it write one last answer with what it has.
+                # The old behaviour errored out here and returned without
+                # persisting anything, losing every tool result of the turn.
+                final_round = True
+                tools = None
+                messages.append(
+                    {
+                        "role": "system",
+                        "content": (
+                            f"You have used all {MAX_TOOL_ROUNDS} tool rounds for this "
+                            "turn. Do not request any more tools. Summarise what you "
+                            "found, what you changed, and what is still left to do."
+                        ),
+                    }
+                )
+                yield {"type": "tool_limit", "rounds": tool_rounds}
     except AdapterError as e:
-        yield {"type": "error", "message": str(e)}
-        return
+        error_message = str(e)
+    except (GeneratorExit, asyncio.CancelledError):
+        raise
     # adapter is cached per server id; no per-turn close
 
     # persist + record
@@ -487,6 +507,8 @@ async def run_turn(chat_id: str, user_text: str, images: list | None = None, rep
         "files": turn_files,
         "cached_tokens": cached_tokens,
     }
+    if error_message:
+        assistant_entry["error"] = error_message
     history.append(assistant_entry)
     ch.save_history(chat_id, history)
     ch.bump_usage(chat_id, final_usage.get("total_tokens", 0))
@@ -522,6 +544,18 @@ async def run_turn(chat_id: str, user_text: str, images: list | None = None, rep
             )
     except (RuntimeError, OSError):
         pass
+    if error_message:
+        # The turn failed, but whatever it managed to do is now saved: the
+        # history above is written before this event, so a mid-turn adapter
+        # failure no longer discards the tool results and partial reply.
+        yield {
+            "type": "error",
+            "message": error_message,
+            "partial": True,
+            "assistant": assistant_full,
+            "files": turn_files,
+        }
+        return
     yield {
         "type": "done",
         "assistant": assistant_full,

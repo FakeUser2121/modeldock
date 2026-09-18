@@ -2,18 +2,59 @@
 
 Routes are added step by step; this module stays the single entry point.
 """
+import contextlib
 import json
 import uuid
 from pathlib import Path
 
 from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import FileResponse, StreamingResponse
+from fastapi.responses import FileResponse, Response, StreamingResponse
 
 from . import config as cfg
 
 WEB_DIR = Path(__file__).resolve().parent.parent / "web"
 
-app = FastAPI(title="modeldock", version="0.1.0")
+
+@contextlib.asynccontextmanager
+async def lifespan(_app: FastAPI):
+    """Tear every per-chat browser down when the server stops.
+
+    Without this the sidecars (and their Chromium processes) survive the
+    server that spawned them, holding a profile directory and RAM with
+    nothing left able to reach them.
+    """
+    yield
+    try:
+        from .browser import shutdown_all
+    except ImportError:
+        return
+    try:
+        shutdown_all()
+    except Exception:
+        pass
+
+
+app = FastAPI(title="modeldock", version="0.1.0", lifespan=lifespan)
+
+
+async def _body(request: Request) -> dict:
+    """Parsed JSON body, or a 400.
+
+    `await request.json()` raises JSONDecodeError on an empty or malformed
+    body, which escapes the handler as an unhandled exception: every POST/PUT
+    below answered a truncated request with a 500 and a stack trace instead
+    of a useful status code.
+    """
+    raw = await request.body()
+    if not raw:
+        return {}
+    try:
+        data = json.loads(raw)
+    except (json.JSONDecodeError, UnicodeDecodeError) as e:
+        raise HTTPException(400, f"invalid JSON body: {e}")
+    if not isinstance(data, dict):
+        raise HTTPException(400, "body must be a JSON object")
+    return data
 
 
 # ---------------- health & config ----------------
@@ -30,7 +71,7 @@ def get_config():
 
 @app.put("/api/config")
 async def put_config(request: Request):
-    new = await request.json()
+    new = await _body(request)
     cfg.save(new)
     return cfg.load()
 
@@ -41,7 +82,7 @@ async def put_config(request: Request):
 async def chat_endpoint(chat_id: str, request: Request):
     from . import turn as t
 
-    body = await request.json()
+    body = await _body(request)
     text = (body.get("message") or "").strip()
     images = body.get("images") or []
     if not isinstance(images, list):
@@ -74,7 +115,7 @@ def list_sessions_api():
 async def create_session_api(request: Request):
     from . import chat as ch
 
-    body = await request.json()
+    body = await _body(request)
     title = (body.get("title") or "").strip()
     workspace = (body.get("workspace") or "").strip()
     if not workspace:
@@ -104,7 +145,7 @@ def get_session_api(chat_id: str):
 async def update_session_api(chat_id: str, request: Request):
     from . import chat as ch
 
-    body = await request.json()
+    body = await _body(request)
     try:
         return ch.update_session(chat_id, body)
     except ValueError as e:
@@ -155,11 +196,20 @@ async def compact_api(chat_id: str, request: Request):
 
 
 @app.post("/api/sessions/{chat_id}/fork")
-def fork_api(chat_id: str):
+async def fork_api(chat_id: str, request: Request):
     from . import chat as ch
 
+    # chat.fork_session has always supported forking from a chosen message;
+    # the route never passed it through, so the UI could only fork whole chats.
+    body = await _body(request)
+    up_to = body.get("up_to_index")
+    if up_to is not None:
+        try:
+            up_to = int(up_to)
+        except (TypeError, ValueError):
+            raise HTTPException(400, "up_to_index must be an integer")
     try:
-        return ch.fork_session(chat_id)
+        return ch.fork_session(chat_id, title=(body.get("title") or ""), up_to_index=up_to)
     except ValueError as e:
         raise HTTPException(400, str(e))
 
@@ -180,7 +230,7 @@ def context_api(chat_id: str):
 async def approve_api(chat_id: str, request: Request):
     from . import approvals
 
-    body = await request.json()
+    body = await _body(request)
     approval_id = (body.get("approval_id") or "").strip()
     if not approval_id:
         raise HTTPException(400, "approval_id is required")
@@ -226,7 +276,7 @@ async def add_server(request: Request):
     from . import servers as srv
     from .adapters import AdapterError
 
-    body = await request.json()
+    body = await _body(request)
     url = (body.get("url") or "").strip()
     if not url:
         raise HTTPException(400, "url is required")
@@ -252,7 +302,7 @@ async def update_server(server_id: str, request: Request):
     from . import servers as srv
     from .adapters import AdapterError
 
-    body = await request.json()
+    body = await _body(request)
     cur = srv.get_server(server_id)
     if not cur:
         raise HTTPException(404, "unknown server")
@@ -319,7 +369,7 @@ async def add_mcp_server(request: Request):
     from . import decisions as dec
     from . import mcp
 
-    body = await request.json()
+    body = await _body(request)
     transport = (body.get("transport") or "http").strip()
     if transport not in ("http", "stdio"):
         raise HTTPException(400, "transport must be 'http' or 'stdio'")
@@ -358,7 +408,7 @@ async def update_mcp_server(server_id: str, request: Request):
     entry = mcp.get_entry(server_id)
     if entry is None:
         raise HTTPException(404, "unknown MCP server")
-    body = await request.json()
+    body = await _body(request)
     merged = {**entry, **body, "id": server_id}
     transport = (merged.get("transport") or "http")
     if transport not in ("http", "stdio"):
@@ -424,7 +474,7 @@ async def add_tool_api(request: Request):
     from . import decisions as dec
     from . import extensions
 
-    body = await request.json()
+    body = await _body(request)
     spec_in = dict(body)
     if (spec_in.get("kind") == "http") and not (spec_in.get("url") or "").strip():
         spec_in["url"] = spec_in.get("template") or ""
@@ -444,7 +494,7 @@ async def update_tool_api(tool_id: str, request: Request):
     spec = extensions.get_by_id(tool_id)
     if spec is None:
         raise HTTPException(404, "unknown tool")
-    body = await request.json()
+    body = await _body(request)
     merged = {**spec, **body, "id": tool_id}
     merged.pop("source", None)
     if (merged.get("kind") == "http") and not (merged.get("url") or "").strip():
@@ -471,6 +521,41 @@ async def delete_tool_api(tool_id: str):
         raise HTTPException(404, str(e))
     dec.record(None, "tool_removed", {"id": tool_id, "name": spec.get("name")})
     return {"ok": True}
+
+
+# ---------------- browser (per-chat CDP sidecar) ----------------
+
+@app.get("/api/sessions/{chat_id}/browser")
+def browser_status_api(chat_id: str):
+    from . import browser
+
+    return browser.status(chat_id)
+
+
+@app.post("/api/sessions/{chat_id}/browser/close")
+def browser_close_api(chat_id: str):
+    from . import browser
+
+    return browser.close(chat_id)
+
+
+@app.get("/api/sessions/{chat_id}/browser/frame")
+def browser_frame_api(chat_id: str):
+    """Latest live frame as JPEG, for the pane beside the chat.
+
+    404 (not 500) while no frame exists yet, so the pane can poll from the
+    moment the chat opens without special-casing startup.
+    """
+    from . import browser
+
+    data = browser.frame_bytes(chat_id)
+    if not data:
+        raise HTTPException(404, "no frame yet")
+    return Response(
+        content=data,
+        media_type="image/jpeg",
+        headers={"Cache-Control": "no-store"},
+    )
 
 
 # ---------------- decision ledgers ----------------
@@ -503,14 +588,30 @@ def index():
     return FileResponse(WEB_DIR / "index.html")
 
 
+def _asset(subdir: str, name: str) -> FileResponse:
+    """Serve one file from web/<subdir>, by plain name only.
+
+    Starlette's router already refuses a path separator here, but the name
+    is user input being joined onto a filesystem path, so it is checked
+    rather than trusted.
+    """
+    if not name or "/" in name or "\\" in name or name.startswith("."):
+        raise HTTPException(404, "not found")
+    target = (WEB_DIR / subdir / name).resolve()
+    root = (WEB_DIR / subdir).resolve()
+    if not target.is_file() or root not in target.parents:
+        raise HTTPException(404, "not found")
+    return FileResponse(target)
+
+
 @app.get("/css/{name}", include_in_schema=False)
 def css(name: str):
-    return FileResponse(WEB_DIR / "css" / name)
+    return _asset("css", name)
 
 
 @app.get("/js/{name}", include_in_schema=False)
 def js(name: str):
-    return FileResponse(WEB_DIR / "js" / name)
+    return _asset("js", name)
 
 
 @app.get("/_sendprobe.html", include_in_schema=False)

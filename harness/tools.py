@@ -20,7 +20,10 @@ allow / deny / approval decision. On `approval`, the turn pauses and asks
 the user (harness/turn.py + POST /api/sessions/{id}/approve).
 """
 import asyncio
+import fnmatch
 import json
+import os
+import re
 import time
 from pathlib import Path
 
@@ -29,7 +32,7 @@ from . import config as cfg
 from . import decisions as dec
 from . import sandbox
 
-MAX_TOOL_ROUNDS = 8
+MAX_TOOL_ROUNDS = 24
 OUTPUT_CAP = 8000
 
 # ---------------------------------------------------------------- schemas
@@ -41,7 +44,11 @@ TOOLS = [
             "name": "run_command",
             "description": (
                 "Run a shell command inside this chat's workspace folder. "
-                "Use it to inspect files, build things, run scripts, etc."
+                "Runs under /bin/sh, so pipes, redirection, && and || chains, "
+                "globs and $VAR expansion all work. Use it to inspect files, "
+                "build things, run scripts, etc. Each call starts in the "
+                "workspace root, so chain with && rather than relying on a cd "
+                "from an earlier call."
             ),
             "parameters": {
                 "type": "object",
@@ -133,6 +140,30 @@ TOOLS = [
     {
         "type": "function",
         "function": {
+            "name": "search_files",
+            "description": (
+                "Search the text of files in this chat's workspace for a regular "
+                "expression and return matching lines with their file:line "
+                "location. This is the fastest way to find where something is "
+                "defined or used — prefer it over reading whole files. Binary "
+                "files, .git and common dependency folders are skipped."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "pattern": {"type": "string", "description": "Python regular expression to search for."},
+                    "path": {"type": "string", "description": "Directory or file to search in (relative to the workspace; default: workspace root)."},
+                    "glob": {"type": "string", "description": "Only search files matching this glob (e.g. '*.py')."},
+                    "ignore_case": {"type": "boolean", "description": "Case-insensitive match (default false)."},
+                    "max_results": {"type": "integer", "description": "Maximum matching lines to return (default 100, max 500)."},
+                },
+                "required": ["pattern"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "todo_add",
             "description": (
                 "Add a todo to this chat's todo list. Use it to plan multi-step work "
@@ -168,9 +199,16 @@ TOOLS = [
     },
 ]
 
-FILE_TOOLS = ("read_file", "write_file", "edit_file", "list_files")
+FILE_TOOLS = ("read_file", "write_file", "edit_file", "list_files", "search_files")
 TODO_TOOLS = ("todo_add", "todo_mark")
 WRITE_FILE_TOOLS = ("write_file", "edit_file", "todo_add", "todo_mark")
+
+# Directories never worth searching; they dwarf the real source tree.
+SKIP_DIRS = {
+    ".git", ".jj", ".hg", ".svn", "node_modules", "__pycache__", ".venv",
+    "venv", ".mypy_cache", ".pytest_cache", ".ruff_cache", "dist", "build",
+    ".modeldock", ".uv-cache",
+}
 
 
 def tool_catalog() -> list[tuple[str, str]]:
@@ -314,9 +352,12 @@ def _ws_path(path_str, workspace: str, allow_outside: bool = False) -> tuple[Pat
     (or when allow_outside is set and it merely resolved).
     """
     ws = Path(workspace).resolve()
-    p = Path(str(path_str or "").strip())
-    if not p.parts:
+    raw = str(path_str or "").strip()
+    if not raw:
         return None, "path is empty"
+    p = Path(raw)
+    # Note: Path(".").parts == (), so testing `parts` treated the workspace
+    # root itself as an empty path and rejected it.
     if not p.is_absolute():
         p = ws / p
     try:
@@ -462,11 +503,90 @@ def _exec_list_files(args: dict, workspace: str, allow_outside: bool = False) ->
     }
 
 
+def _exec_search_files(args: dict, workspace: str, allow_outside: bool = False) -> dict:
+    ws = Path(workspace).resolve()
+    pattern = str(args.get("pattern") or "")
+    if not pattern:
+        return {"ok": False, "error": "search_files: pattern is required"}
+    flags = re.IGNORECASE if args.get("ignore_case") else 0
+    try:
+        rx = re.compile(pattern, flags)
+    except re.error as e:
+        return {"ok": False, "error": f"search_files: bad regular expression: {e}"}
+    base, err = _ws_path(args.get("path") or ".", workspace, allow_outside)
+    if err:
+        return {"ok": False, "error": err}
+    try:
+        cap = max(1, min(int(args.get("max_results") or 100), 500))
+    except (TypeError, ValueError):
+        cap = 100
+    globpat = str(args.get("glob") or "").strip()
+
+    if base.is_file():
+        candidates = [base]
+    elif base.is_dir():
+        candidates = []
+        for root, dirs, files in os.walk(base):
+            dirs[:] = [d for d in dirs if d not in SKIP_DIRS and not d.startswith(".")]
+            for fn in files:
+                p = Path(root) / fn
+                if globpat and not fnmatch.fnmatch(fn, globpat):
+                    continue
+                candidates.append(p)
+            if len(candidates) > 20000:
+                break
+    else:
+        return {"ok": False, "error": f"no such file or directory: {_rel(ws, base)}"}
+
+    matches: list[dict] = []
+    scanned = 0
+    truncated = False
+    for p in sorted(candidates):
+        if len(matches) >= cap:
+            truncated = True
+            break
+        try:
+            if p.stat().st_size > 2_000_000:
+                continue  # skip huge files rather than stalling the turn
+            with p.open("rb") as raw:
+                # NUL bytes are valid UTF-8, so decoding alone does not
+                # identify a binary; this is the usual sniff test.
+                if b"\x00" in raw.read(8192):
+                    continue
+            with p.open("r", encoding="utf-8", errors="strict") as fh:
+                scanned += 1
+                for n, line in enumerate(fh, start=1):
+                    if rx.search(line):
+                        matches.append(
+                            {"file": _rel(ws, p), "line": n, "text": line.rstrip("\n")[:300]}
+                        )
+                        if len(matches) >= cap:
+                            truncated = True
+                            break
+        except (UnicodeDecodeError, OSError):
+            continue  # binary or unreadable: not a text match
+    res = {
+        "ok": True,
+        "pattern": pattern,
+        "path": _rel(ws, base) if base != ws else ".",
+        "files_scanned": scanned,
+        "count": len(matches),
+        "truncated": truncated,
+        "matches": matches,
+    }
+    if truncated:
+        res["note"] = f"stopped at {cap} matches; narrow the pattern or set max_results"
+    elif not matches:
+        res["note"] = "no matches; check the pattern, the path, or try ignore_case=true"
+    return res
+
+
 _FILE_EXEC = {
     "read_file": _exec_read_file,
     "write_file": _exec_write_file,
     "edit_file": _exec_edit_file,
     "list_files": _exec_list_files,
+    "search_files": _exec_search_files,
 }
 
 # --------------------------------------------------------- dispatch
@@ -578,7 +698,13 @@ def _execute_builtin(name: str, args: dict, session: dict, approved: bool = Fals
     if mode == "readonly" and name in ("write_file", "edit_file"):
         return {"decision": "deny", "ok": False, "error": f"readonly mode: {name} is not available"}
 
-    p, err = _ws_path(args.get("path"), workspace, allow_outside=approved)
+    # `path` is optional for the tools that default to the workspace root;
+    # resolving a missing path used to fail with "path is empty", so a bare
+    # list_files (the most natural way to call it) was denied outright.
+    raw_path = args.get("path")
+    if name in ("list_files", "search_files") and not str(raw_path or "").strip():
+        raw_path = "."
+    p, err = _ws_path(raw_path, workspace, allow_outside=approved)
     if err:
         if "outside" in err and not approved:
             # outside the workspace: needs the user's explicit yes

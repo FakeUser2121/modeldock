@@ -22,6 +22,7 @@ sandbox, later step).
 import json
 import re
 import shutil
+import threading
 import time
 import uuid
 from pathlib import Path
@@ -55,21 +56,50 @@ def _valid_id(chat_id: str) -> bool:
 
 # ---------------- registry (chat id -> the folder it lives in) ----------------
 
+_reg_cache: dict | None = None
+_reg_key: tuple | None = None
+_reg_lock = threading.Lock()
+
+
 def _registry() -> dict:
-    if not REGISTRY_FILE.exists():
-        return {}
-    try:
-        data = json.loads(REGISTRY_FILE.read_text(encoding="utf-8"))
-        return data if isinstance(data, dict) else {}
-    except json.JSONDecodeError:
-        return {}
+    """chat id -> {title, workspace, created_at}, cached by (mtime, size).
+
+    `session_dir()` calls this, and `session_dir()` sits under nearly every
+    read in the harness (history, todos, decisions, browser state), so the
+    uncached version meant a stat + read + JSON parse per tool call.
+    """
+    global _reg_cache, _reg_key
+    with _reg_lock:
+        try:
+            st = REGISTRY_FILE.stat()
+        except OSError:
+            _reg_cache, _reg_key = {}, None
+            return {}
+        key = (st.st_mtime_ns, st.st_size)
+        if _reg_cache is not None and key == _reg_key:
+            return _reg_cache
+        try:
+            data = json.loads(REGISTRY_FILE.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError):
+            data = {}
+        _reg_cache = data if isinstance(data, dict) else {}
+        _reg_key = key
+        return _reg_cache
 
 
 def _write_registry(reg: dict) -> None:
+    global _reg_cache, _reg_key
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     tmp = REGISTRY_FILE.with_suffix(".tmp")
     tmp.write_text(json.dumps(reg, indent=1, sort_keys=True), encoding="utf-8")
     tmp.replace(REGISTRY_FILE)
+    with _reg_lock:
+        _reg_cache = reg
+        try:
+            st = REGISTRY_FILE.stat()
+            _reg_key = (st.st_mtime_ns, st.st_size)
+        except OSError:
+            _reg_key = None
 
 
 def _register(chat_id: str, workspace: str, title: str, created_at: float) -> None:
@@ -217,6 +247,9 @@ def update_session(chat_id: str, patch: dict) -> dict:
             raise ValueError(f"workspace does not exist: {ws}")
         meta["workspace"] = str(ws)
         changed["workspace"] = str(ws)
+        # The sidecar's profile lives under the old folder; stop it before
+        # the folder moves so it does not keep writing to a stale path.
+        _close_browser(chat_id)
         # Re-home the chat in the new folder and move its records with it.
         _register(chat_id, str(ws), meta.get("title", "Chat"), meta.get("created_at", 0.0))
         new_dir = session_dir(chat_id)
@@ -259,9 +292,27 @@ def bump_usage(chat_id: str, total_tokens: int) -> dict | None:
 def delete_session(chat_id: str) -> None:
     if not get_session(chat_id):
         raise ValueError("unknown session")
+    _close_browser(chat_id)
     shutil.rmtree(session_dir(chat_id), ignore_errors=True)
     _unregister(chat_id)
     dec.record(None, "session_removed", {"chat_id": chat_id})
+
+
+def _close_browser(chat_id: str) -> None:
+    """Stop this chat's Chromium, if one is running.
+
+    Deleting the session folder (or moving the workspace) out from under a
+    live sidecar leaves an orphaned browser holding a profile directory that
+    no longer exists, and nothing left in the registry can reach it.
+    """
+    try:
+        from .browser import close as browser_close
+    except ImportError:
+        return
+    try:
+        browser_close(chat_id)
+    except Exception:
+        pass
 
 
 def fork_session(chat_id: str, title: str = "", up_to_index: int | None = None) -> dict:
@@ -316,10 +367,26 @@ def get_history(chat_id: str) -> list:
 
 
 def save_history(chat_id: str, messages: list) -> None:
+    """Persist the conversation atomically.
+
+    The folder is created if it is missing: returning silently (the old
+    behaviour) threw away the turn whenever the session folder had not been
+    materialised yet, or had been moved out from under a running turn.
+    """
+    if not _valid_id(chat_id):
+        return
     d = session_dir(chat_id)
-    if not d.is_dir():
+    try:
+        d.mkdir(parents=True, exist_ok=True)
+    except OSError:
         return
     f = d / "messages.json"
     tmp = f.with_suffix(".tmp")
-    tmp.write_text(json.dumps(messages, indent=1), encoding="utf-8")
-    tmp.replace(f)
+    try:
+        tmp.write_text(json.dumps(messages, indent=1), encoding="utf-8")
+        tmp.replace(f)
+    except OSError:
+        try:
+            tmp.unlink()
+        except OSError:
+            pass
