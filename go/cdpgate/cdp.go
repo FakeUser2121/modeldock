@@ -183,15 +183,27 @@ func (s *session) startScreencast(path string) error {
 		// cycle, so each frame was decoded, written and acked N times over.
 		frames := make(chan *page.EventScreencastFrame, 8)
 		go s.frameWriter(frames)
+		// Page.screencastFrameAck must reach Chromium promptly per frame or
+		// the stream stalls — it cannot wait behind the file-write throttle.
+		// But it must NOT be executed inside the chromedp listener callback:
+		// chromedp runs all listeners synchronously on one dispatch goroutine
+		// (Target.run), and Execute waits for its response via that same
+		// listener dispatch, so an in-handler Execute deadlocks the whole
+		// target — no further events arrive and every other command (eval,
+		// navigate) hangs. A dedicated worker drains the unbounded ack queue
+		// instead: each frame is acked the moment it is observed, in order,
+		// off the dispatch path.
+		acks := make(chan int64)
+		go func() {
+			for sid := range acks {
+				_ = s.target.Execute(s.ctx, "Page.screencastFrameAck",
+					map[string]any{"sessionId": sid}, nil)
+			}
+		}()
 		chromedp.ListenTarget(s.ctx, func(ev any) {
 			s.logEvent(ev)
 			if e, ok := ev.(*page.EventScreencastFrame); ok {
-				// Ack first, always, and never from inside the throttle:
-				// Chromium stops sending frames until the previous one is
-				// acked, so acking after a up-to-1s write delay throttled the
-				// stream itself down instead of just the file writes.
-				_ = s.target.Execute(s.ctx, "Page.screencastFrameAck",
-					map[string]any{"sessionId": e.SessionID}, nil)
+				acks <- e.SessionID // unbounded channel: never blocks, never drops
 				select {
 				case frames <- e:
 				default: // writer busy: drop this frame, a newer one is coming
